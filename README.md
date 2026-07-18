@@ -1,79 +1,133 @@
 # LOL-Forager
 
-A local Windows scanner for finding signed .NET binaries that can either compile and run code in memory, or load and execute a caller-supplied assembly. Both are the underlying mechanism behind known LOLBAS entries like `MSBuild.exe`, `InstallUtil.exe`, `RegAsm.exe`, and `TextTransform.exe`, and this script is a way to find other binaries with the same capability that may not be catalogued yet.
+# WDAC / AppLocker Bypass Capability Scanner
 
-## What it does
+`Scan-WdacBypassCapabilities.ps1` inventories the trusted binaries present on a Windows host that can be abused to run unapproved code under a WDAC or AppLocker policy. It is a discovery and audit aid for defenders, detection engineers and policy authors. It does not exploit anything, it reports what is present so you can decide what to block, allow with rules, or monitor.
 
-1. Walks a set of directories (System32, SysWOW64, Program Files, Program Files (x86), ProgramData, the .NET Framework tree, and the .NET Framework GAC by default) looking for `.exe` and `.dll` files.
-2. Checks each file's PE header to confirm it is a managed .NET assembly before doing anything more expensive.
-3. Checks Authenticode signature status and signer.
-4. Scans the raw bytes for a list of known API and type-name fingerprints (see below).
-5. For anything that matches, optionally decompiles the assembly with `ilspycmd` and checks whether the matched pattern shows up in real code, not just a `using` import statement. This is the main false-positive filter.
-6. Writes every match to a CSV as it's found, so an interrupted scan still leaves a usable partial result on disk.
+Every technique it looks for is publicly documented (see the LOLBAS project). Running this tells you which of those vectors actually exist on the box you are assessing.
 
-This is a discovery aid, not a verdict. A match means the binary **contains** the capability. It does not mean that capability is reachable by anything you control, or exploitable. See "What a match does and doesn't tell you" below.
+> Run this only on systems you are authorised to assess. A match means the binary **contains or is a known vector for** the capability, not that it is exploitable in your specific policy. Confirm against your WDAC configuration before drawing conclusions.
 
-## What it finds
+## How it detects things
 
-Matches are grouped into two capability tiers.
+The scan runs two independent layers and reports a file if either fires.
 
-**Tier 1: In-memory compile / dynamic code generation.** The binary can turn source code, or IL instructions, into a running assembly without ever writing that assembly to disk. Covers CodeDom compilation, Roslyn compilation and scripting, raw IL emission (`Reflection.Emit`), embedded scripting engines (IronPython, F# Interactive), T4 templating, inline XSLT scripting, and PowerShell's `Add-Type` hosting path.
+### Layer A: known-LOLBAS catalog (matched by name)
 
-**Tier 2: Trusted loader of caller-supplied code.** The binary loads and executes a DLL that someone else built, without compiling anything itself. Covers InstallUtil-style installer classes, RegAsm/RegSvcs COM registration hooks, generic reflection-based assembly loading (`LoadFrom`, `ExecuteAssembly`, etc.), .NET Core's `AssemblyLoadContext`, and MEF-style plugin catalogs.
+A curated list of binaries whose bypass behaviour is documented. These are matched by file name, because the capability is a property of what the binary does, not of a string you can grep for. This layer is what reliably surfaces the thin launcher EXEs whose real capability code lives in a companion DLL.
 
-Full pattern lists live in the `$fingerprints` variable near the top of the script if you want to see or extend exactly what's being matched.
+Current catalog:
 
-## Reading the CSV
+| Binary | Tier | Technique |
+|---|---|---|
+| InstallUtil.exe | Trusted loader | Installer-class execution via `[RunInstaller(true)]` Install/Uninstall, plus the HelpText override path |
+| RegAsm.exe | Trusted loader | `[ComRegisterFunction]` / `[ComUnregisterFunction]` execution |
+| RegSvcs.exe | Trusted loader | EnterpriseServices registration hooks |
+| AddInProcess.exe, AddInProcess32.exe | Trusted loader | System.AddIn out-of-process add-in host |
+| dotnet.exe | Trusted loader | Native host that runs any managed DLL, `dotnet exec`, `dotnet fsi` |
+| MSBuild.exe | In-memory compile | Inline `<Code>` task compilation (CodeTaskFactory / RoslynCodeTaskFactory) |
+| Microsoft.Build.Tasks.Core.dll | In-memory compile | Hosts the inline-task factories behind MSBuild |
+| csc.exe, vbc.exe, jsc.exe | In-memory compile | Roslyn / JScript compilers |
+| ilasm.exe | In-memory compile | IL assembler (text to PE) |
+| csi.exe | In-memory compile | C# interactive / Roslyn scripting |
+| fsi.exe, fsiAnyCpu.exe | In-memory compile | F# interactive scripting |
+| aspnet_compiler.exe | In-memory compile | ASP.NET precompilation code execution |
+| Microsoft.Workflow.Compiler.exe | In-memory compile | Workflow (XOML) compilation to arbitrary code |
+| System.Configuration.Install.dll | Trusted loader | Hosts the InstallUtil installer machinery |
 
-| Column | Meaning |
-|---|---|
-| `Path` | Full path to the matched binary |
-| `SignatureStatus` | Authenticode status (`Valid` is the interesting case: signed and trusted) |
-| `Signer` | Certificate subject |
-| `Tiers` | JSON array, which tier(s) matched |
-| `MatchedPatterns` | JSON array, every fingerprint string found in the raw bytes |
-| `IlSpyVerification` | `CallSiteFound`, `ReferenceOnlyLikelyFalsePositive`, `UnconfirmedByDecompile`, or `NotChecked` |
-| `CallSitePatterns` | JSON array, patterns confirmed in real decompiled code, not just an import |
-| `ReferenceOnlyPatterns` | JSON array, patterns that only ever appeared as a `using` statement, likely a shared dependency rather than a real capability |
-| `SizeKB` | File size |
+### Layer B: capability fingerprints (managed binaries only)
 
-Start with rows where `SignatureStatus = Valid` and `IlSpyVerification = CallSiteFound`. That's the shortest, highest-confidence list. The console output at the end of a run also prints this subset directly, separated from the likely-false-positive rows.
+For every managed (.NET) binary, the raw bytes are scanned for API and type-name fingerprints in two tiers:
 
-## What a match does and doesn't tell you
+- **Tier1 (in-memory compile)**: CodeDom and Roslyn compilation, `System.Reflection.Emit`, embedded scripting engines (DLR, IronPython, F# interactive), T4 templating, XSLT scripting, PowerShell hosting.
+- **Tier2 (trusted loader)**: installer-class execution, COM registration hooks, reflection-based assembly loading, .NET Core plugin loading (`AssemblyLoadContext`), MEF catalogs.
 
-A `CallSiteFound` match confirms the capability exists and is actually invoked somewhere in the binary, not just referenced. It does **not** confirm that:
-- the input to that call is attacker-controllable (command-line arg, config file, environment variable),
-- the code path is reachable from how the binary is normally launched,
-- the binary is exploitable in your environment.
+This layer catches unknown or third-party binaries that carry the same capability but are not in the catalog.
 
-Those require manual follow-up: decompiling the specific method to trace where its input comes from, checking the binary's supported CLI arguments and config formats, and ideally confirming dynamically with a debugger breakpoint on the matched API while exercising the binary normally.
+Optionally, matched managed binaries are decompiled with `ilspycmd` and each pattern is re-checked against the decompiled source, so a real call site can be told apart from a namespace that merely appears in a `using` line.
+
+## What changed from the previous version, and why your three expected hits were missing
+
+You expected a scan of `C:\Windows\Microsoft.NET\FrameworkArm64\v4.0.30319\` to surface InstallUtil (install and HelpText paths), RegAsm and MSBuild. Here is why the earlier script fell short and how this version fixes it.
+
+1. **Path was not the problem, matching was.** The old default included `C:\Windows\Microsoft.NET` and scanned recursively, so `FrameworkArm64\v4.0.30319` was already covered, and the PE parser already handled PE32+ (ARM64) headers. The framework architecture directories are now listed explicitly (Framework, Framework64, FrameworkArm64) so ARM64 coverage is intentional and obvious rather than incidental.
+
+2. **MSBuild.exe carries no fingerprint of its own.** The inline-task factories (`CodeTaskFactory`, `RoslynCodeTaskFactory`) live in `Microsoft.Build.Tasks.Core.dll`, not in `MSBuild.exe`. A pure byte-scan of the EXE never matched. The catalog now flags `MSBuild.exe` by name as the execution vector and `Microsoft.Build.Tasks.Core.dll` by name as the capability DLL.
+
+3. **InstallUtil.exe was being actively demoted.** The old fingerprint list matched the namespace `System.Configuration.Install`, which in decompiled output appears only as a `using` line. The ILSpy call-site filter strips `using` lines, so the genuine hit was labelled `ReferenceOnlyLikelyFalsePositive` and pushed into the deprioritise bucket. This version adds the actual invoked type and method names (`ManagedInstallerClass`, `InstallHelper`, plus `RunInstaller`), and also flags `InstallUtil.exe` directly via the catalog with both the install-method and HelpText-override techniques noted.
+
+4. **RegAsm / RegSvcs made robust.** Added call-site names (`RegisterAssembly`, `UnregisterAssembly`, `RegistrationHelper`, `RegistrationConfig`) and catalog entries for `RegAsm.exe` and `RegSvcs.exe`.
+
+5. **Native hosts now reported.** `dotnet.exe` is a native apphost, so the old managed-only gate skipped it. The catalog layer now runs before that gate, so native LOLBAS hosts are reported.
+
+6. **New `-CatalogOnly` fast mode**, a broader default path set including `C:\Program Files\dotnet`, and a few extra CodeDom fingerprints (`CompilerParameters`, `CodeSnippetCompileUnit`).
+
+## Requirements
+
+- Windows PowerShell 5.1 or PowerShell 7+.
+- Read access to the paths you scan (run elevated for full `System32` / framework coverage).
+- Optional: `ilspycmd` for call-site verification. The script can install it (via the .NET SDK through winget, then as a dotnet global tool) unless you pass `-SkipIlSpyAutoInstall`. Not used in `-CatalogOnly` mode.
 
 ## Usage
 
+Fast inventory of known bypass binaries present on the host:
+
 ```powershell
-# Full default scan, with ILSpy auto-installed if missing
-.\Scan-InMemoryCompilePatterns.ps1
-
-# Narrow to a specific directory
-.\Scan-InMemoryCompilePatterns.ps1 -ScanPaths "C:\Program Files\dotnet"
-
-# Fast pass, byte-scan only, no decompiler
-.\Scan-InMemoryCompilePatterns.ps1 -SkipIlSpy
-
-# Only .exe files, skip .dll entirely (faster, but misses capabilities
-# implemented in a companion DLL, e.g. RoslynCodeTaskFactory lives in
-# Microsoft.Build.Tasks.Core.dll, not MSBuild.exe itself)
-.\Scan-InMemoryCompilePatterns.ps1 -ExeOnly
-
-# Use ilspycmd if already installed, don't attempt to install it
-.\Scan-InMemoryCompilePatterns.ps1 -SkipIlSpyAutoInstall
-
-# Include WinSxS (large, slow, off by default)
-.\Scan-InMemoryCompilePatterns.ps1 -IncludeWinSxS
+.\Scan-WdacBypassCapabilities.ps1 -CatalogOnly
 ```
 
-## Notes and known limitations
+Targeted run against a single framework directory:
 
-- The raw byte scan only finds strings that are stored contiguously in the assembly's metadata. Namespace strings and standalone type/method names work well. A pattern combining a type name and method name with a dot (e.g. `Assembly.LoadFrom`) generally does not, since .NET metadata stores those as separate entries. The fingerprint list uses standalone tokens for this reason; see the comments in `$fingerprints` for details.
-- `ilspycmd` verification is a heuristic, not a real call graph. It filters out the "imported but never called" false positive, but a dead code path (called from nowhere reachable) will still show as `CallSiteFound`.
-- ILSpy auto-install uses winget to install the .NET SDK if `dotnet` isn't already present, since `ilspycmd` itself only ships as a `dotnet tool`, not a winget package.
+```powershell
+.\Scan-WdacBypassCapabilities.ps1 -ScanPaths "C:\Windows\Microsoft.NET\FrameworkArm64\v4.0.30319"
+```
+
+Full catalog plus fingerprint scan with ILSpy call-site verification:
+
+```powershell
+.\Scan-WdacBypassCapabilities.ps1 -OutputCsv C:\reports\scan.csv
+```
+
+Fingerprint scan without the decompiler:
+
+```powershell
+.\Scan-WdacBypassCapabilities.ps1 -SkipIlSpy
+```
+
+### Parameters
+
+| Parameter | Default | Purpose |
+|---|---|---|
+| `-ScanPaths` | Framework trees, GACs, System32, SysWOW64, Program Files (both), dotnet, ProgramData | Roots to search recursively |
+| `-IncludeWinSxS` | off | Also scan WinSxS (slow, low extra signal) |
+| `-OutputCsv` | `.\WdacBypassScan.csv` | Report path |
+| `-MaxFileSizeMB` | 64 | Skip larger files for the byte-scan (catalog matches still report) |
+| `-ExeOnly` | off | Only scan `.exe` (misses capability DLLs; MSBuild.exe still caught by catalog) |
+| `-CatalogOnly` | off | Name-match only, no byte-scan or ILSpy (fastest) |
+| `-SkipIlSpy` | off | No decompiler verification |
+| `-SkipIlSpyAutoInstall` | off | Use ilspycmd if present, but do not install it |
+
+## Output columns
+
+| Column | Meaning |
+|---|---|
+| `Path`, `FileName` | Location and name |
+| `DetectionSource` | `Catalog`, `Fingerprint`, or `Both` |
+| `KnownLolbasTechnique` | Documented technique, for catalog hits |
+| `Tiers` | Capability tiers hit (compile and/or trusted loader) |
+| `SignatureStatus`, `Signer` | Authenticode / catalog signature result |
+| `MatchedPatterns` | Fingerprints found in the bytes |
+| `IlSpyVerification` | `KnownLolbas`, `CallSiteFound`, `ReferenceOnlyLikelyFalsePositive`, `UnconfirmedByDecompile`, or `NotChecked` |
+| `CallSitePatterns` / `ReferenceOnlyPatterns` | ILSpy classification detail |
+| `Notes` | Technique detail for catalog hits |
+| `SizeKB` | File size |
+
+The console summary prints catalog hits first (top priority), then signed non-catalog binaries with a confirmed call site, then likely false positives to deprioritise.
+
+## Interpreting results, and honest limitations
+
+- **Signature status matters.** A validly signed, Microsoft-signed catalog binary is the highest-interest case for bypass review, because the whole point of a LOLBAS is that it is already trusted. On modern Windows these binaries are catalog-signed rather than embedded-signed; `Get-AuthenticodeSignature` reports that as `Valid`.
+- **The ILSpy call-site pass is a heuristic, not a call graph.** It can miss a genuine reference buried in a structural line and can pass a dead-code or string-literal match. Treat it as a triage sort, not proof.
+- **A catalog match is authoritative for presence, not for exploitability.** Whether a given vector actually bypasses your policy depends on your WDAC rules (signer rules, path rules, managed-code enforcement, blocklist coverage). Microsoft publishes a recommended blocklist that covers most of these binaries; cross-check your policy against it.
+- **The catalog is not exhaustive.** It covers the well-known .NET vectors. Layer B is there to catch the rest, but no signature list is complete. Keep the catalog and fingerprint lists updated as new techniques are published.
+- **This finds capability, not intent or activity.** It is an attack-surface inventory, not an incident detector.
