@@ -1,4 +1,4 @@
-# Scan-InMemoryCompilePatterns
+# Forager
 
 A local Windows scanner for finding signed .NET binaries that can either compile and run code in memory, or load and execute a caller-supplied assembly. Both are the underlying mechanism behind known LOLBAS entries like `MSBuild.exe`, `InstallUtil.exe`, `RegAsm.exe`, and `TextTransform.exe`, and this script is a way to find other binaries with the same capability that may not be catalogued yet.
 
